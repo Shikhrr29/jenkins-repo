@@ -1,1 +1,224 @@
-hello buddy!! WHATCHA LOOKIN AT..?? STRANGAA
+pipeline {
+    agent any
+    
+    environment {
+        DOCKER_REGISTRY = 'my-repo'
+        IMAGE_TAG = "${BUILD_NUMBER}"
+      
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_COMMIT_SHORT = sh(
+                        script: 'git rev-parse --short HEAD',
+                        returnStdout: true
+                    ).trim()
+                }
+            }
+        }
+        
+        stage('Install Dependencies') {
+            parallel {
+                stage('Backend Dependencies') {
+                    steps {
+                        dir('backend') {
+                            sh 'npm ci'
+                        }
+                    }
+                }
+                stage('Frontend Dependencies') {
+                    steps {
+                        dir('frontend') {
+                            sh 'npm ci'
+                        }
+                    }
+                }
+                stage('ML Dependencies') {
+                    steps {
+                        dir('ml-service') {
+                            sh 'pip install -r requirements.txt'
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Lint & Test') {
+            parallel {
+                stage('Backend') {
+                    steps {
+                        dir('backend') {
+                            sh 'npm run lint'
+                            sh 'npm test'
+                        }
+                    }
+                    post {
+                        always {
+                            publishTestResults testResultsPattern: 'backend/test-results.xml'
+                        }
+                    }
+                }
+                stage('Frontend') {
+                    steps {
+                        dir('frontend') {
+                            sh 'npm run lint'
+                            sh 'npm run test'
+                        }
+                    }
+                }
+                stage('ML Service Test') {
+                    steps {
+                        dir('ml-service') {
+                            sh 'python -m pytest tests/ --junitxml=test-results.xml'
+                        }
+                    }
+                    post {
+                        always {
+                            publishTestResults testResultsPattern: 'ml-service/test-results.xml'
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Build Images') {
+            parallel {
+                stage('Build Frontend') {
+                    steps {
+                        script {
+                            dir('frontend') {
+                                sh "docker build -t ${DOCKER_REGISTRY}/devops-frontend:${IMAGE_TAG} ."
+                            }
+                        }
+                    }
+                }
+                stage('Build Backend') {
+                    steps {
+                        script {
+                            dir('backend') {
+                                sh "docker build -t ${DOCKER_REGISTRY}/devops-backend:${IMAGE_TAG} ."
+                            }
+                        }
+                    }
+                }
+                stage('Build ML Service') {
+                    steps {
+                        script {
+                            dir('ml-service') {
+                                sh "docker build -t ${DOCKER_REGISTRY}/devops-ml:${IMAGE_TAG} ."
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Integration Test') {
+            steps {
+                script {
+                    // Start services
+                    sh "docker-compose -f docker-compose.test.yml up -d"
+                    
+                    // Wait for services to be ready
+                    timeout(time: 5, unit: 'MINUTES') {
+                        waitUntil {
+                            script {
+                                def ready = sh(
+                                    script: 'curl -f http://localhost:5000/health && curl -f http://localhost:8000/health',
+                                    returnStatus: true
+                                ) == 0
+                                return ready
+                            }
+                        }
+                    }
+                    
+                    // Run integration tests
+                    sh '''
+                        # Test auth endpoints
+                        curl -f -X POST http://localhost:5000/api/auth/signup \
+                            -H "Content-Type: application/json" \
+                            -d '{"email":"test@example.com","password":"testpass123","role":"developer"}'
+                        
+                        # Test ML service
+                        curl -f -X POST http://localhost:8000/api/v1/predict \
+                            -H "Content-Type: application/json" \
+                            -d '{"text":"Error: Module not found","stage":"build"}'
+                        
+                        # Test log ingestion
+                        curl -f -X POST http://localhost:5000/api/runs/ingest \
+                            -H "Content-Type: application/json" \
+                            -H "Authorization: Bearer $AUTH_TOKEN" \
+                            -d '{"repo":"test/repo","stage":"build","text":"Build failed with error"}'
+                    '''
+                }
+            }
+            post {
+                always {
+                    sh "docker-compose -f docker-compose.test.yml down"
+                }
+            }
+        }
+        
+        stage('Deploy') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    // Push images to registry
+                    sh "docker push ${DOCKER_REGISTRY}/frontend:${IMAGE_TAG}"
+                    sh "docker push ${DOCKER_REGISTRY}/backend:${IMAGE_TAG}"
+                    sh "docker push ${DOCKER_REGISTRY}/ml:${IMAGE_TAG}"
+                    
+                    // Deploy to staging/production
+                    sh """
+                        docker-compose -f docker-compose.prod.yml down
+                        IMAGE_TAG=${IMAGE_TAG} docker-compose -f docker-compose.prod.yml up -d
+                    """
+                }
+            }
+        }
+        
+        stage('Post-Deploy Test') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    // Attach pipeline logs to our own system
+                    sh '''
+                        PIPELINE_LOG=$(cat ${WORKSPACE}/pipeline.log 2>/dev/null || echo "No pipeline log found")
+                        curl -X POST http://localhost:5000/api/runs/ingest \
+                            -H "Content-Type: application/json" \
+                            -H "Authorization: Bearer ${JENKINS_API_TOKEN}" \
+                            -d 
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            // Archive artifacts
+            archiveArtifacts artifacts: '**/test-results.xml', fingerprint: true
+            
+            // Clean up
+            sh 'docker system prune -f'
+        }
+        success {
+            slackSend(
+                channel: '#project',
+                color: 'good',
+            )
+        }
+        failure {
+            slackSend(
+                channel: '#devops',
+                color: 'danger',
+            )
+        }
+    }
+}
